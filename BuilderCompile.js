@@ -1,5 +1,5 @@
 class BuilderCompile {
-    static run(autoRunFork) {
+    static async run(autoRunFork) {
         // Make sure a GMS2 project is open!
         let project = $gmedit["gml.Project"].current;
         if (Builder.ProjectVersion(project) != 2) return;
@@ -11,7 +11,6 @@ class BuilderCompile {
         
         // Create or reuse output tab!
         let output = BuilderOutput.open(false);
-        output.clear(`Compile Started: ${Builder.GetTime()}`);
         let abort = (text) => {
             output.write(text);
             return false;
@@ -90,7 +89,10 @@ class BuilderCompile {
             //
             try {
                 let userSettings = JSON.parse(Electron_FS.readFileSync(`${Userpath}/local_settings.json`));
+                let dir;
                 Temporary = userSettings["machine.General Settings.Paths.IDE.TempFolder"];
+                dir = userSettings["machine.General Settings.Paths.IDE.AssetCacheFolder"];
+                if (dir) GMS2CacheDir = dir + "\\GMS2CACHE";
                 steamworksPath = userSettings["machine.Platform Settings.Steam.steamsdk_path"];
             } catch (x) {
                 console.error("Failed to read temporary folder path, assuming default.", x);
@@ -135,14 +137,36 @@ class BuilderCompile {
                 return;
             }
         }
-        if (Electron_FS.existsSync(`${Builder.Runtime}/${isWindows ? "windows/Runner.exe" : "mac/YoYo Runner.app"}`) == false) {
-            output.write(`!!! Could not find ${isWindows ? "Runner.exe" : "YoYo Runner.app"} in ${Runtime}/${isWindows ? "windows/" : "mac/"}`);
+        let runnerPath = null;
+        let x64flag = null; // determines value of /64bitgame= (null to not pass)
+        let optPlat = null; // platform options YY (to avoid loading them twice)
+        if (isWindows) {
+            if (Electron_FS.existsSync(runnerPath = `${Builder.Runtime}/windows/Runner.exe`)) {
+                try {
+                    optPlat = project.readYyFileSync(`options/windows/options_windows.yy`);
+                    x64flag = optPlat["option_windows_use_x64"];
+                } catch (e) {
+                    console.log("Error checking x64 flag:", e);
+                }
+            } else if (Electron_FS.existsSync(runnerPath = `${Builder.Runtime}/windows/x64/Runner.exe`)) {
+                // no x86 runtime so this surely is x64
+                x64flag = true;
+            } else runnerPath = null;
+        } else {
+            if (Electron_FS.existsSync(runnerPath = `${Builder.Runtime}/mac/YoYo Runner.app`)) {
+                // OK!
+            } else runnerPath = null;
+        }
+        if (runnerPath == null) {
+            output.write(`!!! Could not find runner executable in "${Builder.Runtime}"`);
             Builder.Stop();
             return;
         }
+        Builder.RunnerPath = runnerPath;
         Builder.MenuItems.stop.enabled = true;
 
         // Create substitute drive on Windows!
+        const TemporaryUnmapped = Temporary;
         if (isWindows && BuilderPreferences.current.useVirtualDrives) {
             let drive = BuilderDrives.add(Temporary);
             if (drive == null) {
@@ -158,46 +182,245 @@ class BuilderCompile {
         Builder.Outpath = Temporary + Name + "_" + Builder.Random();
         output.write("Using output path: " + Builder.Outpath);
         output.write(""); // GMAC doesn't line-break at the start
+        
+        /*
+        Target bit flags:
+        Windows: 1 << 6
+        Mac: 1 << 1
+        IOS: 1 << 2
+        Android: 1 << 3
+        HTML5: 1 << 5
+        Linux: 1 << 7
+        WASM: 1 << 63
+        OperaGX: 1 << 34
+        */
+        const targetMask = isWindows ? 64 : 2;
+        const targetMachine = isWindows ? "windows" : "mac";
+        const targetMachineFriendly = isWindows ? "Windows" : "macOS";
+        
+        // I don't know where I'm supposed to get feature flag list from
+        let ffe = (function() {
+            let plain = "operagx-yyc,intellisense,nullish,login_sso,test";
+            let shifted = "";
+            for (let i = 0; i < plain.length; i++) {
+                shifted += String.fromCharCode(plain.charCodeAt(i) + 10);
+            }
+            return btoa(shifted);
+        })();
+        
+        // Apparently using forward slashes in paths breaks caching now, go figure
+        const fixSlashes = (path) => {
+            return isWindows ? path.split("/").join("\\") : path;
+        }
+        
+        let outputPath = `${Builder.Outpath}/${Builder.Name}.${Builder.Extension}`;
+        
+        const compilerArgs = [
+            `/compile`,
+            `/majorv=1`, // /mv
+            `/minorv=0`, // /iv
+            `/releasev=0`, // /rv
+            `/buildv=0`, // /bv
+            `/zpex`, // GMS2 mode
+            `/NumProcessors=8`, // /j
+            `/gamename=${Name}`, // /gn spaces/etc. will be replaced automatically
+            `/TempDir=${fixSlashes(Temporary)}`, // /td
+            `/CacheDir=${fixSlashes(Builder.Cache)}`, // /cd
+            `/runtimePath=${fixSlashes(Builder.Runtime)}`, // /rtp
+            `/zpuf=${fixSlashes(Userpath)}`, // GMS2 user folder
+            `/machine=${targetMachine}`, // /m
+            `/target=${targetMask}`, // /tgt
+            `/llvmSource=${fixSlashes(Builder.Runtime + "/interpreted/")}`,
+            `/nodnd`,
+            `/config=${project.config}`,
+            `/outputDir=${fixSlashes(Builder.Outpath)}`,
+            `/ShortCircuit=True`,
+            `/optionsini=${fixSlashes(Builder.Outpath + "/options.ini")}`,
+            `/CompileToVM`,
+            `/baseproject=${fixSlashes(Builder.Runtime + "/BaseProject/BaseProject.yyp")}`,
+            `/verbose`,
+            `/bt=run`, // build type
+            `/runtime=vm`, // "vm" or "yyc"
+        ];
+        if (!/^runtime-[27]\./.test(runtimeSelection)) {
+            // not 2.x/7.x - in other words, 2022+
+            compilerArgs.push(`/debug`);
+            compilerArgs.push(`/ffe=${ffe}`);
+        }
+        if (x64flag != null) compilerArgs.push("/64bitgame=" + x64flag);
+        compilerArgs.push(project.path);
+        //for (let arg of compilerArgs) output.write(arg);
+        //
+        let extensionNames = []; // only for 2.3+!
+        try {
+            if (project.isGMS23) for (let resName in project.yyResources) {
+                let res = project.yyResources[resName];
+                if (res == null) continue;
+                let id = res.id;
+                if (id == null) continue;
+                let extName = id.name;
+                if (extName == null) continue;
+                let extRel = id.path;
+                if (extRel == null || !extRel.startsWith("extensions/")) continue;
+                extensionNames.push(resName);
+            }
+        } catch (e) {
+            console.error("Failed to enumerate extensions:", e);
+        }
+        
+        //
+        let runUserCommandStep_env = null
+        const runUserCommandStep_init_env = () => {
+            let env = {};
+            // collecting extension options is a little messy but what can you do
+            for (let resName of extensionNames) {
+                let res = project.yyResources[resName];
+                let id = res.id;
+                let extName = id.name;
+                let extRel = id.path;
+                if (extRel == null || !extRel.startsWith("extensions/")) continue;
+                let optRel = "options/extensions/" + id.name + ".json";
+                if (!project.existsSync(optRel)) continue;
+                try {
+                    let ext = project.readYyFileSync(extRel);
+                    let optRoot = project.readYyFileSync(optRel);
+                    let configurables = optRoot.configurables;
+                    for (let optDef of ext.options) {
+                        if (optDef.optType == 5) continue; // label!
+                        let optGUID = optDef.guid;
+                        let optVal = configurables[optGUID];
+                        if (optVal != null
+                            && typeof(optVal) == "object"
+                            && optVal.Default != null
+                        ) optVal = optVal.Default.value;
+                        optVal ??= optDef.defaultValue;
+                        if (optVal == null) continue;
+                        env[`YYEXTOPT_${extName}_${optDef.name}`] = optVal;
+                    }
+                } catch (e) {
+                    console.error(`Error while getting options for ${id.name}:`, e);
+                }
+            }
+            //
+            try {
+                let optMain = project.readYyFileSync("options/main/options_main.yy");
+                for (let key in optMain) {
+                    //if (!key.startsWith("option_")) continue;
+                    env["YYMAIN_" + key] = optMain[key];
+                }
+            } catch (e) {
+                console.error("Error while getting main options:", e);
+            }
+            //
+            env["YYPLATFORM_name"] = targetMachineFriendly;
+            try {
+                let platName = targetMachine;
+                optPlat ??= project.readYyFileSync(`options/${platName}/options_${platName}.yy`);
+                for (let key in optPlat) {
+                    //if (!key.startsWith("option_")) continue;
+                    env["YYPLATFORM_" + key] = optPlat[key];
+                }
+            } catch (e) {
+                console.error("Error while getting platform options:", e);
+            }
+            //
+            env["YYTARGET_runtime"] = "VM";
+            env["YYtargetMask"] = targetMask;
+            env["YYoutputFolder"] = Builder.Outpath;
+            env["YYassetCompiler"] = " " + compilerArgs.join(" ");
+            env["YYcompile_output_file_name"] = outputPath;
+            env["YYconfig"] = project.config;
+            env["YYconfigParents"] = ""; // TODO
+            env["YYdebug"] = "False";
+            env["YYprojectName"] = Name;
+            env["YYprojectPath"] = project.path;
+            env["YYprojectDir"] = project.dir;
+            env["YYruntimeLocation"] = Builder.Runtime;
+            env["YYruntimeVersion"] = runtimeSelection;
+            env["YYuserDir"] = Userpath;
+            env["YYtempFolder"] = TemporaryUnmapped;
+            env["YYtempFolderUnmapped"] = TemporaryUnmapped;
+            env["YYverbose"] = "True";
+            //
+            //console.log(env);
+            Object.assign(env, process.env);
+            runUserCommandStep_env = env;
+        }
+        /** @returns {bool} trouble */
+        const runUserCommandStep_1 = async (path) => {
+            if (!project.isGMS23) return false;
+            path = project.fullPath(path);
+            //console.log(path, Electron_FS.existsSync(path));
+            if (!Electron_FS.existsSync(path)) return false;
+            // Well? I don't want to print streams when we're done, I want it as it happens
+            if (runUserCommandStep_env == null) runUserCommandStep_init_env();
+            let proc;
+            try {
+                output.write(`Running "${path}"`);
+                output.write("");
+                proc = Builder.Command.spawn(path, {
+                    env: runUserCommandStep_env
+                });
+            } catch (e) {
+                output.write(`Failed to run "${path}": ` + e);
+                console.error(`Failed to run "${path}":`, e);
+                return true;
+            }
+            let exitCode = null;
+            proc.stdout.on("data", (e) => {
+               output.write(e.toString(), false);
+            });
+            proc.stderr.on("data", (e) => {
+                output.write(e.toString(), false);
+            });
+            proc.on("close", (_exitCode) => {
+                exitCode = _exitCode;
+                output.write(`Finished "${path}", exitCode=${_exitCode} (0x${_exitCode.toString(16)})`);
+            });
+            Builder.Compiler = proc;
+            const asyncSleep = (delay) => {
+                return new Promise((resolve, reject) => {
+                    setTimeout(() => resolve(null), delay);
+                });
+            }
+            let waitCount = 0;
+            while (exitCode == null) {
+                waitCount += 1;
+                let waitAmt = waitCount < 10 ? 10 : waitCount < 50 ? 25 : 50;
+                await asyncSleep(waitAmt);
+            }
+            Builder.Compiler = null;
+            return exitCode != 0;
+        }
+        const runUserCommandStep = async (name) => {
+            let scriptRel = name + (isWindows?".bat":".sh");
+            if (await runUserCommandStep_1(scriptRel)) return true;
+            for (let resName of extensionNames) {
+                let res = project.yyResources[resName];
+                let esPath = $gmedit["haxe.io.Path"].directory(res.id.path) + "/" + scriptRel;
+                if (await runUserCommandStep_1(esPath)) return true;
+            }
+            return false;
+        }
 
         // Run the compiler!
-        let compilerArgs = [
-            `/c`,
-            `/mv=1`,
-            `/zpex`,
-            `/iv=0`,
-            `/rv=0`,
-            `/bv=0`,
-            `/j=8`,
-            `/gn=${Name}`,
-            `/td=${Temporary}`,
-            `/cd=${Builder.Cache}`,
-            `/rtp=${Builder.Runtime}`,
-            `/zpuf=${Userpath}`,
-            `/m=${isWindows? "windows" : "mac"}`,
-            `/tgt=2`,
-            `/llvmSource=${Builder.Runtime}/interpreted/`,
-            `/nodnd`,
-            `/cfg=${$gmedit["gml.Project"].current.config}`,
-            `/o=${Builder.Outpath}`,
-            `/sh=True`,
-            `/optionsini=${Builder.Outpath}/options.ini`,
-            `/cvm`,
-            `/baseproject=${Builder.Runtime}/BaseProject/BaseProject.yyp`,
-            `${$gmedit["gml.Project"].current.path}`,
-            `/v`,
-            `/bt=run`,
-            `/rt=vm`
-        ];
+        let compileStartTime = Date.now();
+        if (await runUserCommandStep("pre_build_step")) return;
         if (isWindows) {
             Builder.Compiler = Builder.Command.spawn(GMAssetCompilerPath, compilerArgs, {
                 cwd: Builder.Runtime,
             });
+        } else if (DotNET6Flag) {
+            Builder.Compiler = Builder.Command.spawn(GMAssetCompilerPath, compilerArgs);
         } else {
-            if (DotNET6Flag) Builder.Compiler = Builder.Command.spawn(GMAssetCompilerPath, compilerArgs);
-            else Builder.Compiler = Builder.Command.spawn("/Library/Frameworks/Mono.framework/Versions/Current/Commands/mono", [GMAssetCompilerPath].concat(compilerArgs));
+            Builder.Compiler = Builder.Command.spawn(
+                "/Library/Frameworks/Mono.framework/Versions/Current/Commands/mono",
+                [GMAssetCompilerPath].concat(compilerArgs)
+            );
         }
-
+        
         // Capture compiler output!
+        output.write(""); // (because stdout is appended raw)
         Builder.Compiler.stdout.on("data", (e) => {
             let text = e.toString();
             switch (Builder.Parse(text, 0)) {
@@ -213,8 +436,14 @@ class BuilderCompile {
             }
         });
 
-        Builder.Compiler.on("close", (exitCode) => {
-            if (exitCode != 0 || Builder.Compiler == undefined || Builder.ErrorMet == true) { Builder.Clean(); return; }
+        Builder.Compiler.on("close", async (exitCode) => {
+            if (exitCode != 0 || Builder.Compiler == undefined || Builder.ErrorMet) {
+                BuilderOutput.main.write(`Compile Ended: ${Builder.GetTime()} (${(Date.now() - compileStartTime)/1000}s)`);
+                Builder.CleanRuntime();
+                if (BuilderPreferences.current.cleanOnError) Builder.CleanCache();
+                return;
+            }
+            BuilderOutput.main.write(`Compile Finished: ${Builder.GetTime()} (${(Date.now() - compileStartTime)/1000}s)`);
 
             // Rename output file!
             if (Name != Builder.Name || !isWindows) {
@@ -234,13 +463,17 @@ class BuilderCompile {
             } catch (x) {
                 console.error("Failed to copy steam_api:", x);
             }
+            Builder.Compiler = undefined;
             
+            if (await runUserCommandStep("post_build_step")) return;
+
+            if (await runUserCommandStep("pre_run_step")) return;
             BuilderOutputAside.clearOnNextOpen = true;
-            BuilderOutputTerminal.clearOnNextOpen = true;
-            Builder.Runner.push(Builder.Spawn(Builder.Runtime, Builder.Outpath, Builder.Name));
+            Builder.Runner.push(Builder.Spawn(Builder.Runtime, Builder.Outpath, Builder.Name, false, (_code) => {
+                runUserCommandStep("post_run_step");
+            }));
             Builder.MenuItems.fork.enabled = true;
             if (autoRunFork) Builder.Fork();
-            Builder.Compiler = undefined;
         });
 	}
 }
