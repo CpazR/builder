@@ -475,5 +475,5 @@ class BuilderCompile {
             Builder.MenuItems.fork.enabled = true;
             if (autoRunFork) Builder.Fork();
         });
-    }
+	}
 }
